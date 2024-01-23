@@ -1,0 +1,1012 @@
+---
+title: "NK-Mono Crosstalk Manuscript"
+output: html_document
+date: "2024-01-23"
+---
+
+
+Load libraries
+
+```{r libraries}
+library(Matrix)
+library(NatParksPalettes)
+library("magrittr")
+#library(Matrix.utils)
+library(plyr)
+library(dplyr)
+library(Seurat) 
+library(sctransform)
+library(igraph)
+library(factoextra)
+library(ComplexHeatmap)
+library(circlize)
+require(Hmisc)
+require(dplyr)
+require(openxlsx)
+require(ggplot2)
+library(ggpubr)
+require(cowplot)
+library(data.table)
+library(topGO)
+library(RColorBrewer)
+library(ALL)
+library(SingleR)
+library(scater)
+library(pheatmap)
+library(nichenetr)
+library(tidyverse)
+library(readr)
+library(flextable)
+#library(FlexDotPlot)
+library(phateR)
+library(scales)
+library(SeuratWrappers)
+library(ggsci)
+library(UpSetR)
+library(plotly)
+library(pROC)
+library(SingleCellExperiment)
+library(glue)
+library(ggExtra)
+library(EnhancedVolcano)
+#library(GEOquery)
+library(scriabin)
+library(multinichenetr)
+library(pbapply)
+
+```
+
+## The first section of this document contains the code for the cell-cell communication analyses that were performed on the scRNA-seq dataset from Wilk et al, 2021 (J Exp Med) and used to make Figs. 1-2 of the manuscript. The raw data used here is available under GEO accession no. GSE174072. The fully processed Seurat object is available upon request. The main packages used here are Seurat, Scriabin, and MultiNicheNet.
+
+## Skip to line 550 for the code used to make the plots in Figs. 3-7 in case you really want to see the code for approximately 10,000 nearly-identical boxplots.
+
+Load in Seurat object
+```{r panel 1b}
+setwd("/Users/mjanelee/Library/CloudStorage/GoogleDrive-mjanelee@stanford.edu/.shortcut-targets-by-id/0B5PFTPY_3B9MdkpncmIzRW43UEk/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/repo")
+covid_combined <- readRDS(file = "/Users/mjanelee/Library/CloudStorage/GoogleDrive-mjanelee@stanford.edu/.shortcut-targets-by-id/0B5PFTPY_3B9MdkpncmIzRW43UEk/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/repo/blish_awilk_covid_seurat.rds")
+
+```
+
+Subset down to only severe and healthy donors
+```{r}
+Idents(covid_combined) <- "Severity.current.final"
+severe.healthy <- subset(covid_combined, idents = c("0", "6-7"))
+
+```
+
+Run ALRA on the whole severe and healthy dataset by breaking it up and then smushing back together
+```{r}
+
+# divide dataset into groups of 20K cells
+
+severe.healthy$Donor <- as.factor(severe.healthy$Donor)
+
+cellsmeta = severe.healthy@meta.data
+sub20k_index <- round(nrow(cellsmeta)/20000, 0)
+randomnumbers <- round(runif(n=nrow(cellsmeta), min = 1, max = (sub20k_index + 1)), 0)
+cellsmeta["sub20k.index"] <- randomnumbers
+
+cellsmetaTrim <- subset(cellsmeta, select = "sub20k.index")
+
+severe.healthy <- AddMetaData(severe.healthy, cellsmetaTrim)
+severe.healthy$sub20k.index <- as.factor(severe.healthy$sub20k.index)
+
+severe.healthy.split <- SplitObject(severe.healthy, split.by = "sub20k.index")
+
+# run ALRA on each subset of 20K cells
+
+for (i in names(severe.healthy.split)) {
+  severe.healthy.split[[i]] <- SeuratWrappers::RunALRA(severe.healthy.split[[i]], q.k = 10)
+  print(paste("Finished running ALRA on subset", i, "of", length(names(severe.healthy.split))))
+}
+
+# squish subsets of 20K cells back together into one object that now has ALRA reduction
+
+severe.healthy.alra <- merge(x = severe.healthy.split[[1]], y = severe.healthy.split[2:length(severe.healthy.split)], merge.data = TRUE)
+
+# Save object so you don't have to do this again
+
+saveRDS(severe.healthy.alra, file= "severe_healthy_alra_split_POST-merge.rds")
+
+```
+
+### This section is from the Interaction Program workflow within the Scriabin package and is used to make Figure 1 of the manuscript.
+
+Identify significant interaction programs
+```{r}
+# identify interaction programs
+
+Idents(severe.healthy.alra) <- "cell.type.coarse"
+seu_healthy_ip <- InteractionPrograms(severe.healthy.alra, iterate.threshold = 300, assay = "alra")
+
+# compare interaction program expression between two donor groups. save files as you go so you don't have to do this again
+
+seu_fip <- FindAllInteractionPrograms(severe.healthy.alra, group.by = "Severity.current.final", 
+                                      assay = "alra")
+seu_fip_sig <- InteractionProgramSignificance(seu_fip)
+severe.healthy.alra <- ScoreInteractionPrograms(severe.healthy.alra, mods = seu_fip_sig)
+
+saveRDS(severe.healthy.alra, file= "severe_healthy_alra_split_POST-merge_interaction_programs_scored.rds")
+
+saveRDS(seu_fip_sig, file= "severe_healthy_alra_split_POST-merge_interaction_programs.rds")
+
+```
+
+Do the same thing but filtered down on only severe donors
+```{r}
+# Subset down to only severe donors
+Idents(severe.healthy.alra) <- "Severity.current.final"
+severe <- subset(severe.healthy.alra, idents = "6-7")
+
+# Identify interaction programs
+seu_severe_fip <- FindAllInteractionPrograms(severe, group.by = "Severity.current.final", assay = "alra")
+seu_severe_fip_sig <- InteractionProgramSignificance(seu_severe_fip)
+severe <- ScoreInteractionPrograms(severe, mods = seu_severe_fip_sig)
+```
+
+Summarize cell type interactions within severe donors
+```{r}
+ip_by_celltype <- IPCellTypeSummary(severe, group.by = "cell.type.coarse")
+ip_by_celltype %>% group_by(sender) %>% top_n(n = 1, wt = additive.score)
+
+```
+
+Identify cell types that have the most interactions with NK cells (our cell type of interest, as always)
+```{r}
+# Filter down to interactions in which NK cells are the receiver
+ip_nk_filtered <- ip_by_celltype %>% dplyr::filter(receiver == "NK")
+
+# Combine CD14 and CD16 monocytes into one group (optional step)
+ip_nk_filtered$sender[ip_nk_filtered$sender=="CD16 mono"] <- "Monocyte"
+ip_nk_filtered$sender[ip_nk_filtered$sender=="CD14 mono"] <- "Monocyte"
+
+# Summarize cell type interactions
+ip_nk_summary <- ip_nk_filtered %>% group_by(sender) %>% summarise(sum = sum(additive.score))
+ip_nk_summary_sort <- ip_nk_summary[order(ip_nk_summary$sum, decreasing = F), ]
+order <- ip_nk_summary_sort$sender
+ip_nk_summary$sender %<>% factor(levels = order)
+
+# Plot the summed interaction scores for each cell type with NK cells
+plot <- ggplot(data = ip_nk_summary, aes(x = sender,y = sum))
+plot + 
+  geom_bar(aes(fill = sender), stat = "summary") +
+  #scale_fill_taylor(palette = "lover") + 
+  coord_flip() +
+  xlab("Sender cell type") +
+  ylab("Summed interaction score") +
+  theme_light() + theme(text = element_text(size = 25), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), legend.position = "none", strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"))
+
+```
+
+Do the same thing but filtered down on only healthy donors
+```{r}
+# Subset down to only severe donors
+Idents(severe.healthy.alra) <- "Severity.current.final"
+healthy <- subset(severe.healthy.alra, idents = "0")
+
+# Identify interaction programs
+seu_healthy_fip <- FindAllInteractionPrograms(healthy, group.by = "Severity.current.final", assay = "alra")
+seu_healthy_fip_sig <- InteractionProgramSignificance(seu_healthy_fip)
+healthy <- ScoreInteractionPrograms(healthy, mods = seu_healthy_fip_sig)
+```
+
+Summarize cell type interactions within severe donors
+```{r}
+ip_by_celltype <- IPCellTypeSummary(healthy, group.by = "cell.type.coarse")
+ip_by_celltype %>% group_by(sender) %>% top_n(n = 1, wt = additive.score)
+
+```
+
+Identify cell types that have the most interactions with NK cells (our cell type of interest, as always)
+```{r}
+# Filter down to interactions in which NK cells are the receiver
+ip_nk_filtered <- ip_by_celltype %>% dplyr::filter(receiver == "NK")
+
+# Combine CD14 and CD16 monocytes into one group (optional step)
+ip_nk_filtered$sender[ip_nk_filtered$sender=="CD16 mono"] <- "Monocyte"
+ip_nk_filtered$sender[ip_nk_filtered$sender=="CD14 mono"] <- "Monocyte"
+
+# Summarize cell type interactions
+ip_nk_summary <- ip_nk_filtered %>% group_by(sender) %>% summarise(sum = sum(additive.score))
+ip_nk_summary_sort <- ip_nk_summary[order(ip_nk_summary$sum, decreasing = F), ]
+order <- ip_nk_summary_sort$sender
+ip_nk_summary$sender %<>% factor(levels = order)
+
+# Plot the summed interaction scores for each cell type with NK cells
+plot <- ggplot(data = ip_nk_summary, aes(x = sender,y = sum))
+plot + 
+  geom_bar(aes(fill = sender), stat = "summary") +
+  #scale_fill_taylor(palette = "lover") + 
+  coord_flip() +
+  xlab("Sender cell type") +
+  ylab("Summed interaction score") +
+  theme_light() + theme(text = element_text(size = 25), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), legend.position = "none", strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"))
+
+```
+
+Okay, now go back to all donors and subset the Seurat object down to NKs and Monocytes
+```{r}
+Idents(severe.healthy.alra) <- "cell.type.coarse"
+nk.mono <- subset(severe.healthy.alra, idents = c("NK", "CD14 mono", "CD16 mono"))
+
+```
+
+Find interaction programs in this subset
+```{r}
+seu_nk_mono_fip <- FindAllInteractionPrograms(nk.mono, group.by = "Severity.current.final", assay = "alra")
+seu_nk_mono_fip_sig <- InteractionProgramSignificance(seu_nk_mono_fip)
+nk.mono <- ScoreInteractionPrograms(nk.mono, mods = seu_nk_mono_fip_sig)
+
+saveRDS(seu_nk_mono_fip_sig, file = "seu_nk_mono_fip_sig.rds")
+saveRDS(nk.mono, file = "nk.mono_scored.rds")
+
+```
+
+
+Look at relative expression of receptors from each IP between conditions in NK cells (the receiver cell of interest here)
+```{r}
+seu_id_ip_rec <- as.matrix(nk.mono[["IPreceptors"]]@data %>% t() %>%
+  as.data.frame() %>% add_column(celltype = nk.mono$cell.type.coarse) %>% add_column(severity = nk.mono$Severity.current.final) %>% dplyr::filter(celltype == "NK") %>% mutate(severity_celltype = paste(celltype, severity, sep = "_")) %>%
+  group_by(severity_celltype) %>%
+  summarise_if(is.numeric, mean) %>% column_to_rownames("severity_celltype"))
+Heatmap(seu_id_ip_rec, show_column_names = T, name = "Receptors")
+
+```
+
+Look at relative expression of ligands from each IP between conditions in CD14 monocytes (the sender cell of interest here)
+```{r}
+seu_id_ip_lig <- as.matrix(nk.mono[["IPligands"]]@data %>% t() %>%
+  as.data.frame() %>% add_column(celltype = nk.mono$cell.type.coarse) %>% add_column(severity = nk.mono$Severity.current.final) %>% dplyr::filter(celltype == "CD14 mono") %>% mutate(severity_celltype = paste(celltype, severity, sep = "_")) %>%
+  group_by(severity_celltype) %>%
+  summarise_if(is.numeric, mean) %>% column_to_rownames("severity_celltype"))
+Heatmap(seu_id_ip_lig, show_column_names = T, name = "Ligands")
+
+```
+
+### This section uses the MultiNicheNet package and is used to make Figure 2 and Supplementary Figure 1 of the manuscript.
+
+Set up environment, data, etc
+```{r}
+#Clear current environment (to ensure code runs only with what is given here)
+rm(list = ls())
+
+#Set data path and figure path
+data_path <- "/oak/stanford/groups/cblish/izumi/COVID/CCC/works/Maddie/"
+
+fig_path <- "/oak/stanford/groups/cblish/izumi/COVID/CCC/works/Maddie/"
+message("finished data/fig paths")
+
+# Convenience functions
+SaveFigure <- function(plots, name, type = "png", width, height, res){
+    if(type == "png") {
+        png(paste0(fig_path, name, ".", type),
+        width = width, height = height, units = "in", res = 200)
+    } else {
+        pdf(paste0(fig_path, name, ".", type),
+        width = width, height = height)
+    }
+    print(plots)
+    dev.off()
+}
+
+SaveObject <- function(object, name){
+    saveRDS(object, paste0(data_path, name, ".RDS"))
+}
+
+ReadObject <- function(name){
+    readRDS(paste0(data_path, name, ".RDS"))
+}
+```
+
+Load in required background data from OmniPath and Seurat object
+```{r}
+#Load ligand-receptor network and ligand-target matrix
+organism = "human"
+lr_network = readRDS(url("https://zenodo.org/record/7074291/files/lr_network_human_21122021.rds"))
+lr_network = lr_network %>% dplyr::rename(ligand = from, receptor = to) %>% distinct(ligand, receptor) %>% mutate(ligand = make.names(ligand), receptor = make.names(receptor))
+ligand_target_matrix = readRDS("/oak/stanford/groups/cblish/Rebecca/Parse/analysis/IRIS_megakit_analysis_code/ligand_target_matrix_nsga2r_final.rds")
+colnames(ligand_target_matrix) = colnames(ligand_target_matrix) %>% make.names()
+rownames(ligand_target_matrix) = rownames(ligand_target_matrix) %>% make.names()
+message("finished line85")
+
+#Load seurat object, set idents for research question
+seu <- readRDS("/oak/stanford/groups/cblish/izumi/COVID/CCC/works/Maddie/covid_combined.rds")
+Idents(seu) <- "cell.type.coarse"
+seu <- subset(seu, idents = c("CD14 mono", "NK"))
+Idents(seu) <- "Severity.current.final"
+seu <- subset(seu, idents = c("0", "6-7"))
+```
+
+Convert object to SCE and ensure data is properly named
+```{r}
+#convert to SCE, update gene symbols
+sce <- Seurat::as.SingleCellExperiment(seu, assay = "RNA")
+sce <- alias_to_symbol_SCE(sce, "human") %>% makenames_SCE()
+message("finished sce")
+
+#Define metadata columns
+SummarizedExperiment::colData(sce)$Donor = SummarizedExperiment::colData(sce)$Donor %>% make.names()
+SummarizedExperiment::colData(sce)$cell.type.coarse = SummarizedExperiment::colData(sce)$cell.type.coarse %>% make.names()
+SummarizedExperiment::colData(sce)$Severity.current.final = SummarizedExperiment::colData(sce)$Severity.current.final %>% make.names()
+message("madenames")
+```
+
+Define parameters and perform DE analysis
+```{r}
+sample_id = "Donor"
+group_id = "Severity.current.final"
+celltype_id = "cell.type.coarse"
+covariates = NA
+batches = NA
+
+#Define sender and receiver cell types
+senders_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+receivers_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+
+
+#Extract cell type abundance, expression data
+min_cells = 10
+abundance_expression_info = get_abundance_expression_info(sce = sce, sample_id = sample_id, group_id = group_id,
+         celltype_id = celltype_id, min_cells = min_cells, senders_oi = senders_oi, receivers_oi = receivers_oi,
+         lr_network = lr_network)
+abundance_plot <- abundance_expression_info$abund_plot_sample
+abundance_plot
+SaveFigure(abundance_plot, "abundance_plot", width = 9, height = 18)
+message("finished saving abundance plot")
+
+
+#Define contrasts, covariates, perform DE analysis
+contrasts_oi = c("'X0-X6.7','X6.7-X0'")
+contrast_tbl = tibble(
+  contrast = c("X0-X6.7","X6.7-X0"),
+  group = c("X0","X6.7"))
+DE_info = get_DE_info(sce = sce, sample_id = sample_id, group_id = group_id, celltype_id = celltype_id, batches = batches,
+                      covariates = covariates, contrasts_oi = contrasts_oi, min_cells = min_cells)
+DE_info$celltype_de$de_output_tidy %>% arrange(p_adj) %>% head()
+celltype_de = DE_info$celltype_de$de_output_tidy
+message("finished DE")
+
+#Combine DE for ligand-senders and receptors-receivers
+sender_receiver_de = combine_sender_receiver_de(
+  sender_de = celltype_de,
+  receiver_de = celltype_de,
+  senders_oi = senders_oi,
+  receivers_oi = receivers_oi,
+  lr_network = lr_network
+)
+sender_receiver_de %>% head(20)
+message("finished senderrecieverDE")
+
+```
+
+Predict ligand activities
+```{r}
+
+#Predict NicheNet ligand activities and ligand-target links based on DE results
+logFC_threshold = 0.5
+p_val_threshold = 0.05
+fraction_cutoff = 0.05
+p_val_adj = FALSE #In case of more samples per group, and high number of DE genes per group (>50), recommend using adjusted p values
+top_n_target = 250 #select top n of predicted target genes to be considered
+verbose = TRUE
+cores_system = 8
+n.cores = min(cores_system, sender_receiver_de$receiver %>% unique() %>% length()) # use one core per receiver cell type
+ligand_activities_targets_DEgenes = suppressMessages(suppressWarnings(get_ligand_activities_targets_DEgenes(
+  receiver_de = celltype_de,
+  receivers_oi = receivers_oi,
+  ligand_target_matrix = ligand_target_matrix,
+  logFC_threshold = logFC_threshold,
+  p_val_threshold = p_val_threshold,
+  p_val_adj = p_val_adj,
+  top_n_target = top_n_target,
+  verbose = verbose,
+  n.cores = n.cores
+)))
+message("finished activities")
+
+#Check DE genes used for activity analysis and the output of the analysis
+ligand_activities_targets_DEgenes$de_genes_df %>% head(20)
+ligand_activities_targets_DEgenes$ligand_activities %>% head(20)
+```
+
+Define priorities and group
+```{r}
+#Define prioritization weights, prepare grouping objects
+prioritizing_weights_DE = c("de_ligand" = 1,
+                            "de_receptor" = 1)
+prioritizing_weights_activity = c("activity_scaled" = 2)
+
+prioritizing_weights_expression_specificity = c("exprs_ligand" = 2,
+                                                "exprs_receptor" = 2)
+
+prioritizing_weights_expression_sufficiency = c("frac_exprs_ligand_receptor" = 1)
+
+prioritizing_weights_relative_abundance = c( "abund_sender" = 0,
+                                             "abund_receiver" = 0)
+prioritizing_weights = c(prioritizing_weights_DE,
+                         prioritizing_weights_activity,
+                         prioritizing_weights_expression_specificity,
+                         prioritizing_weights_expression_sufficiency,
+                         prioritizing_weights_relative_abundance)
+sender_receiver_tbl = sender_receiver_de %>% dplyr::distinct(sender, receiver)
+
+metadata_combined = SummarizedExperiment::colData(sce) %>% tibble::as_tibble()
+message("finished prioritization")
+
+if(!is.na(batches)){
+  grouping_tbl = metadata_combined[,c(sample_id, group_id, batches)] %>% tibble::as_tibble() %>% dplyr::distinct()
+  colnames(grouping_tbl) = c("sample","group",batches)
+} else {
+  grouping_tbl = metadata_combined[,c(sample_id, group_id)] %>% tibble::as_tibble() %>% dplyr::distinct()
+  colnames(grouping_tbl) = c("sample","group")
+}
+message("finished line199")
+
+#Run prioritization
+prioritization_tables = suppressMessages(generate_prioritization_tables(
+  sender_receiver_info = abundance_expression_info$sender_receiver_info,
+  sender_receiver_de = sender_receiver_de,
+  ligand_activities_targets_DEgenes = ligand_activities_targets_DEgenes,
+  contrast_tbl = contrast_tbl,
+  sender_receiver_tbl = sender_receiver_tbl,
+  grouping_tbl = grouping_tbl,
+  prioritizing_weights = prioritizing_weights,
+  fraction_cutoff = fraction_cutoff,
+  abundance_data_receiver = abundance_expression_info$abundance_data_receiver,
+  abundance_data_sender = abundance_expression_info$abundance_data_sender
+))
+message("finished line214")
+
+prioritization_tables$group_prioritization_tbl %>% head(20)
+
+lr_target_prior_cor = lr_target_prior_cor_inference(prioritization_tables$group_prioritization_tbl$receiver %>% unique(),
+                                                    abundance_expression_info, celltype_de, grouping_tbl, prioritization_tables, ligand_target_matrix,
+                                                    logFC_threshold = logFC_threshold, p_val_threshold = p_val_threshold, p_val_adj = p_val_adj)
+message("finished line221")
+
+#Save output of MultiNicheNet
+path = "/oak/stanford/groups/cblish/izumi/COVID/CCC/works/Maddie/"
+```
+
+Save multinichenet object output
+```{r}
+multinichenet_output = list(
+  celltype_info = abundance_expression_info$celltype_info,
+  celltype_de = celltype_de,
+  sender_receiver_info = abundance_expression_info$sender_receiver_info,
+  sender_receiver_de =  sender_receiver_de,
+  ligand_activities_targets_DEgenes = ligand_activities_targets_DEgenes,
+  prioritization_tables = prioritization_tables,
+  grouping_tbl = grouping_tbl,
+  lr_target_prior_cor = lr_target_prior_cor
+)
+multinichenet_output = make_lite_output(multinichenet_output)
+
+save = TRUE
+if(save == TRUE){
+  saveRDS(multinichenet_output, paste0(path, "multinichenet_output_maddie.rds"))
+  
+}
+```
+
+Make circos plot. Manually remove ligand-receptor interactions with no empirical evidence to support them.
+```{r}
+#Circos plot of top-prioritized links
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(multinichenet_output$prioritization_tables, 50, rank_per_group = FALSE)
+prioritized_tbl_oi = multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  filter(id %in% prioritized_tbl_oi_M_50$id) %>%
+  distinct(id, sender, receiver, ligand, receptor, group) %>% left_join(prioritized_tbl_oi_all)
+prioritized_tbl_oi$prioritization_score[is.na(prioritized_tbl_oi$prioritization_score)] = 0
+
+senders_receivers = union(prioritized_tbl_oi$sender %>% unique(), prioritized_tbl_oi$receiver %>% unique()) %>% sort()
+
+prioritized_tbl_oi_select <- prioritized_tbl_oi %>% dplyr::filter(ligand != "ADAM17" & ligand != "ADAM9" & ligand != "B2M" & ligand != "HLA.A" & receptor != "TAP1" & receptor != "TAP2" & ligand != "F13A1" & receptor != "CD8A" & ligand != "TIMP2" & ligand != "COL8A2" & ligand != "DUSP18" & receptor != "KLRD1" & ligand != "CD82" & ligand != "LILRB2" & ligand != "SIRPA" & ligand != "LRPAP1" & ligand != "TGFBI" & ligand != "CLEC2B" & ligand != "HLA.DRA")  %>% dplyr::filter(ligand != "HLA.B" | receptor != "KIR2DL3") %>% dplyr::filter(ligand != "HLA.G" | receptor != "KIR3DL1")
+
+colors_sender = c("red3", "darkorange") %>% magrittr::set_names(senders_receivers)
+
+colors_receiver = c("red3", "darkorange") %>% magrittr::set_names(senders_receivers)
+
+circos_list = make_circos_group_comparison(prioritized_tbl_oi_select, colors_sender, colors_receiver)
+
+```
+
+Analyze downstream target activity
+```{r}
+
+#Visualize scaled ligand-receptor pseudobulk products and ligand activity
+group_oi = "X0"
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(multinichenet_output$prioritization_tables, 50, groups_oi = group_oi)
+
+plot_oi = make_sample_lr_prod_activity_plots(multinichenet_output$prioritization_tables, prioritized_tbl_oi_M_50)
+plot_oi
+
+contrast_tbl = tibble(
+  contrast = c("X0-X6.7","X6.7-X0"),
+  group = c("X0","X6.7"))
+
+group_oi = c("X6.7")
+receiver_oi = "NK"
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(multinichenet_output$prioritization_tables, 50, groups_oi = group_oi, receivers_oi = receiver_oi)
+
+prioritized_tbl_oi_select <- prioritized_tbl_oi %>% dplyr::filter(ligand != "ADAM17" & ligand != "ADAM9" & ligand != "B2M" & ligand != "HLA.A" & receptor != "TAP1" & receptor != "TAP2" & ligand != "F13A1" & receptor != "CD8A" & ligand != "TIMP2" & ligand != "COL8A2" & ligand != "DUSP18" & receptor != "KLRD1" & ligand != "CD82" & ligand != "LILRB2" & ligand != "SIRPA" & ligand != "LRPAP1" & ligand != "TGFBI" & ligand != "IL10") %>% dplyr::filter(ligand != "HLA.B" | receptor != "LILRB1") %>% dplyr::filter(ligand != "HLA.B" | receptor != "KIR2DL3") %>% dplyr::filter(ligand != "HLA.G" | receptor != "KIR3DL1")
+
+combined_plot = make_ligand_activity_target_plot(group_oi = group_oi, 
+                                                 receiver_oi = receiver_oi, 
+                                                 prioritized_tbl_oi = prioritized_tbl_oi_select,
+                                                 prioritization_tables = multinichenet_output$prioritization_tables,
+                                                 ligand_activities_targets_DEgenes=multinichenet_output$ligand_activities_targets_DEgenes,
+                                                 contrast_tbl = contrast_tbl, 
+                                                 grouping_tbl = multinichenet_output$grouping_tbl,
+                                                 receiver_info =  multinichenet_output$celltype_info, 
+                                                 ligand_target_matrix = ligand_target_matrix, 
+                                                 plot_legend = FALSE)
+combined_plot
+
+```
+
+### Welcome to the part where I have put the code for the many boxplots in the paper. The fcs files and O-link result file from which these data were derived are all available on Immport (accession no. SDY2498). The .csv files containing the data used here are available in the GitHub repository containing this code.
+
+Load in data, make everything a factor, and format so the data are easier to graph. Set up the lists of statistical comparisons that we will use later.
+```{r}
+setwd("/Users/mjanelee/Library/CloudStorage/GoogleDrive-mjanelee@stanford.edu/.shortcut-targets-by-id/0B5PFTPY_3B9MdkpncmIzRW43UEk/Blish Lab/00 - All Server Data and Folders/Maddie/COVID projects/COVID Monocyte + NK")
+table <- read.csv("COVID_mono_no_MJL05_new.csv")
+table$Donor %<>% as.factor()
+table$NK_donor %<>% as.factor()
+table$Mono_donor %<>% as.factor()
+#table$Infection %<>% as.factor()
+table$Condition %<>% factor(levels = c("Healthy", "Moderate", "Severe"))
+table$Mono_donor_condition %<>% factor(levels = c("None", "Healthy", "Moderate", "Severe"))
+table$Donor_infection %<>% factor(levels = c("Healthy", "COVID-19", "A549"))
+table$Expt %<>% as.factor()
+table$Culture %<>% as.factor()
+table$Round %<>% as.factor()
+table$Incubation_hr %<>% as.factor()
+table$Fatal %<>% as.factor()
+table$Condition_fatal %<>% factor(levels = c("Healthy", "Moderate", "Severe", "Fatal", "A549"))
+table$Status %<>% factor(levels = c("Healthy", "Survived", "Fatal"))
+table$Conv_plasma %<>% as.factor()
+table$Leronlamib_trial %<>% as.factor()
+table$ECMO %<>% as.factor()
+table$Dexamethasone %<>% as.factor()
+table$Gimsilumab_mavrilimumab_trial %<>% as.factor()
+table$Toclizumab %<>% as.factor()
+table$Remdesivir %<>% as.factor()
+
+table$Mono_donor_condition_fatal %<>% factor(levels = c("None", "Healthy", "Moderate", "Severe", "Fatal"))
+
+table_all <- table %>% select(-Avg_NKG2D, -NK_NKG2D, -Avg_Ki67, -Avg_Perforin, -Avg_CD38, -Avg_CD69, -Avg_GzmB, -Avg_DNAM1, -Avg_CD16, -Avg_perc_NKG2D, -NK_perc_NKG2D, -Avg_activated) 
+graph_all <- table_all %>% gather(Marker, MFI, -Donor, -Condition, -NK_donor, -Mono_donor, -Expt, -Sample, -Mono_donor_condition, -Donor_infection, -Culture, -Round, -Fatal, -Incubation_hr, -Condition_fatal, -Mono_donor_condition_fatal, -Status, -Conv_plasma, -Leronlamib_trial, -ECMO, -Dexamethasone, -Gimsilumab_mavrilimumab_trial, -Toclizumab, -Remdesivir)
+
+table_avg <- table %>% select(-Ki67, -Perforin, -CD38, -CD69, -GzmB, -DNAM1, -NKG2D, -CD16, -NK_NKG2D, -Perc_NKG2D, -NK_perc_NKG2D, -NK_GzmB, -Bystander_killing, -SARS_killing, -Activated, -Perc_infected)
+graph_avg <- table_avg %>% gather(Marker, MFI, -Donor, -Condition, -NK_donor, -Mono_donor, -Expt, -Sample, -Mono_donor_condition, -Donor_infection, -Culture, -Round, -Fatal, -Incubation_hr, -Condition_fatal, -Mono_donor_condition_fatal, -Status, -Conv_plasma, -Leronlamib_trial, -ECMO, -Dexamethasone, -Gimsilumab_mavrilimumab_trial, -Toclizumab, -Remdesivir)
+
+table_killing <- table %>% select(-Ki67, -Perforin, -CD38, -CD69, -GzmB, -DNAM1, -NKG2D, -CD16, -NK_NKG2D, -Perc_NKG2D, -NK_perc_NKG2D, -NK_GzmB, -Activated)
+
+table_killing %<>% mutate(subtracted_killing = ifelse(Bystander_killing == 0, NA, (SARS_killing - Bystander_killing)/Bystander_killing))
+graph_killing <- table_killing %>% gather(Marker, MFI, -Donor, -Condition, -NK_donor, -Mono_donor, -Expt, -Sample, -Mono_donor_condition, -Donor_infection, -Culture, -Round, -Fatal, -Incubation_hr, -Condition_fatal, -Mono_donor_condition_fatal, -Status, -Conv_plasma, -Leronlamib_trial, -ECMO, -Dexamethasone, -Gimsilumab_mavrilimumab_trial, -Toclizumab, -Remdesivir)
+
+my_comparisons <- list(c("Healthy", "Moderate"), c("Healthy", "Severe"))
+my_comparisons_2 <- list(c("Healthy", "COVID-19"))
+my_comparisons_fatal <- list(c("Healthy", "Moderate"), c("Healthy", "Severe"), c("Healthy", "Fatal"))
+```
+
+Add in Ki-67 frequency data
+```{r}
+ki67 <- read.csv("Ki67_freqs.csv")
+table_comb <- merge(table, ki67, all=TRUE)
+write.csv(table_comb, "COVID_mono_no_MJL05_new_ki67freqs.csv")
+
+cols <- c("Ki67_freq", "Ki67", "Perforin", "NKG2D", "DNAM1", "CD16", "GzmB", "CD69", "CD38")
+table_comb %<>% group_by(Culture, Expt, Mono_donor, Condition, Donor_infection, Fatal, Status, Condition_fatal, Donor) %>% summarise_at(.vars = cols, .funs = "mean")
+
+graph_comb_avg <- table_comb %>% gather(Marker, MFI, -Donor, -Condition, -Mono_donor, -Expt, -Donor_infection, -Culture, -Fatal, -Condition_fatal, -Status)
+
+```
+
+### Figure 3
+
+Plot killing of SARS-CoV-2-infected and bystander cells (Figure 3)
+```{r}
+labs <- c("Bystander killing", "Infected cell killing")
+names(labs) <- c("Bystander_killing", "SARS_killing")
+
+plot <- ggplot(data = graph_killing %>% dplyr::filter(Mono_donor == "None") %>% dplyr::filter(Donor != "MJL01" & Donor != "MJL03") %>% dplyr::filter(Marker == "Bystander_killing" | Marker == "SARS_killing"), 
+               aes(x = Donor_infection, y = MFI))
+plot +
+  facet_wrap(~Marker, nrow = 1, scale = "free_y", labeller = labeller(Marker = labs)) +
+  geom_jitter(aes(color = Condition_fatal, shape = Status), size = 4) +
+  geom_boxplot(aes(fill = Donor_infection), alpha = 0.5, outlier.colour = NA) +
+  scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+  scale_fill_manual(values=natparks.pals("SmokyMtns", 4)) +
+  ylab("MFI") +
+  xlab("NK donor status") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.1))) +
+  stat_compare_means(comparisons = my_comparisons_2, bracket.size = 0.6, paired=F, size = 5, label = "p.signif") +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank(), legend.position = "none")
+```
+
+### Figure 4
+
+Donor treatment upset plot
+```{r}
+table_upset <- table %>% dplyr::filter(Mono_donor == "None") %>% distinct(Donor, .keep_all = TRUE) %>% select(Donor, Condition_fatal,  Conv_plasma, Leronlamib_trial, ECMO, Dexamethasone, Gimsilumab_mavrilimumab_trial, Toclizumab, Remdesivir) %>% dplyr::filter(Condition_fatal != "A549")
+
+table_upset %<>% rename(`Convalescent plasma` = "Conv_plasma")
+table_upset %<>% rename(`Leronlamib trial` = "Leronlamib_trial")
+table_upset %<>% rename(`Gimsilumab/Mavrilimumab trial` = "Gimsilumab_mavrilimumab_trial")
+
+table_upset[table_upset=="N"] <- FALSE
+table_upset[table_upset=="Y"] <- TRUE
+table_upset[is.na(table_upset)] <- FALSE
+table_upset$Donor %<>% as.character()
+
+table_upset <- na.omit(table_upset)
+
+colnames(table_upset)
+treatments <- colnames(table_upset)[3:9]
+ComplexUpset::upset(table_upset, treatments,
+                    name = "Treatment",
+                    width_ratio = 0.1,
+                    base_annotations = list('Intersection size'=intersection_size(counts=F,
+                                                            mapping=aes(fill=Condition_fatal)))) & scale_fill_manual(values=natparks.pals("SmokyMtns", 4))
+```
+
+Donor metadata plot
+```{r}
+setwd("/Users/mjanelee/Library/CloudStorage/GoogleDrive-mjanelee@stanford.edu/.shortcut-targets-by-id/0B5PFTPY_3B9MdkpncmIzRW43UEk/Blish Lab/00 - All Server Data and Folders/Maddie/COVID projects/COVID Monocyte + NK")
+meta <- read.csv(file = "COVID_NK_mono_meta.csv")
+meta$Severity.Category %<>% factor(levels = c("Moderate", "Severe", "Fatal"))
+pal <- natparks.pals("SmokyMtns", 4)
+
+p <- ggscatter(meta, "Days_test","Age",
+          color = "Severity.Category", 
+          palette = pal[2:4],
+          size = 3) + labs(x = "Days post-positive swab")
+ggMarginal(p, margins = "y", groupColour = T, groupFill = F)
+ggMarginal(p, margins = "x", groupColour = T, groupFill = F)
+p
+```
+
+This is the basic code that was used to generate all NK cell phenotype plots in the paper (co-culture or freshly-isolated). The parameters of the graph can be adapted to look at different culture conditions.
+```{r}
+plot <- ggplot(data = graph_all %>% dplyr::filter(Mono_donor == "None" & Culture != "Transwell" & Expt != "Mono_2" & Donor != "MJL01" & Donor != "MJL03" & Donor != "A549") %>% dplyr::filter(Marker != "Bystander_killing" & Marker != "SARS_killing" & Marker != "NK_GzmB" & Marker != "Live" & Marker != "Perc_NKG2D" & Marker != "Perc_infected") %>% dplyr::filter(), aes(x = Condition, y = MFI))
+plot +
+  facet_wrap(~Marker, nrow = 4, scale = "free_y") +
+  geom_jitter(aes(color = Condition_fatal, shape = Status), size = 4, width = 0.2) +
+  geom_boxplot(aes(), alpha = 0) +
+  scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+  #scale_fill_taylor() +
+  ylab("% Ki-67+") +
+  xlab("Monocyte donor condition") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.1))) +
+  #ylim(c(0,100)) +
+  stat_compare_means(label = "p.signif", comparisons = my_comparisons, bracket.size = 0.6, paired=F, size = 6) +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank())
+
+```
+
+This code was used/adapted to generate NK cell subset phenotype plots for all culture conditions.
+```{r}
+table_subset <- read.csv("COVID_mono_NK_subset_final.csv")
+table_subset$Donor %<>% as.factor()
+table_subset$NK_donor %<>% as.factor()
+table_subset$Mono_donor %<>% as.factor()
+table_subset$Subset %<>% factor(levels = c("CD56brightCD16low", "CD56dimCD16low", "CD56dimCD16hi"))
+table_subset$Condition %<>% factor(levels = c("Healthy", "Moderate", "Severe"))
+table_subset$Mono_donor_condition %<>% factor(levels = c("None", "Healthy", "Moderate", "Severe"))
+table_subset$Donor_infection %<>% factor(levels = c("Healthy", "COVID-19"))
+table_subset$Status %<>% factor(levels = c("Healthy", "Survived", "Fatal"))
+table_subset$Expt %<>% as.factor()
+table_subset$Culture %<>% as.factor()
+table_subset$Round %<>% as.factor()
+table_subset$Incubation_hr %<>% as.factor()
+table_subset$Condition_fatal %<>% factor(levels = c("Healthy", "Moderate", "Severe", "Fatal"))
+table_subset$Mono_donor_condition_fatal %<>% factor(levels = c("None", "Healthy", "Moderate", "Severe", "Fatal"))
+
+table_subset_all <- table_subset %>% select(-Avg_NKG2D, -Avg_Ki67, -Avg_perforin, -Avg_CD38, -Avg_CD69, -Avg_GzmB, -Avg_DNAM1, -Avg_activated) 
+graph_subset_all <- table_subset_all %>% gather(Marker, MFI, -Donor, -Condition, -NK_donor, -Mono_donor, -Expt, -Sample, -Mono_donor_condition, -Donor_infection, -Culture, -Round, -Fatal, -Incubation_hr, -Condition_fatal, -Mono_donor_condition_fatal, -Subset, -Status)
+
+table_subset_avg <- table_subset %>% select(-Ki67, -Perforin, -CD38, -CD69, -GzmB, -DNAM1, -NKG2D, -Bright_freq, -Dim_freq, -uDim_freq, -Activated)
+graph_subset_avg <- table_subset_avg %>% gather(Marker, MFI, -Donor, -Condition, -NK_donor, -Mono_donor, -Expt, -Sample, -Mono_donor_condition, -Donor_infection, -Culture, -Round, -Fatal, -Incubation_hr, -Condition_fatal, -Mono_donor_condition_fatal, -Subset, -Status)
+
+### Can swap out the marker of interest
+
+subset.labs <- c("CD56+ CD16-", "CD56dim CD16-", "CD56dim CD16+")
+names(subset.labs) <- c("CD56brightCD16low", "CD56dimCD16low", "CD56dimCD16hi")
+
+plot <- ggplot(data = graph_subset_all %>% dplyr::filter(Mono_donor != "None" & Culture == "Normal") %>% dplyr::filter(Marker == "Avg_NKG2D"), aes(x = Condition, y = MFI))
+plot +
+  facet_wrap(~Subset, nrow = 1, labeller = labeller(Subset = subset.labs)) +
+  geom_jitter(aes(color = Condition_fatal, shape = Fatal), size = 4) +
+  geom_boxplot(aes(), alpha = 0, outlier.colour = NA) +
+  scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+  scale_fill_taylor() +
+  ylab("% Activated\n(CD38+CD69+)") +
+  xlab("NK donor condition") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.1))) +
+  stat_compare_means(label = "p.signif", comparisons = my_comparisons, bracket.size = 0.6, paired=F, size = 5) +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank())
+
+```
+
+Treatment analysis (Fig. S2)
+```{r}
+my_comparisons_treat <- list(c("Y", "N"))
+pal <- natparks.pals("SmokyMtns", 4)[2:4]
+
+# Swapped out "remdisivir" with each individual treatment to get all the different plots
+
+plot <- ggplot(data = graph_all %>% 
+                 dplyr::filter(Mono_donor == "None") %>% 
+                 dplyr::filter(Marker != "Bystander_killing" & Marker != "SARS_killing" & Marker != "NK_GzmB" & Marker != "Perc_NKG2D" & Marker != "Activated" & Donor_infection == "COVID-19" & Marker != "Perc_infected") %>% dplyr::filter(Remdesivir == "Y" | Remdesivir == "N"), 
+               aes(x = Remdesivir, y = MFI))
+plot +
+  facet_wrap(~Marker, nrow = 2, scale = "free_y") +
+  geom_jitter(aes(color = Condition_fatal, shape = Status), size = 4) +
+  geom_boxplot(aes(), alpha = 0, outlier.colour = NA) +
+  scale_color_manual(values=pal) +
+  #scale_fill_manual(values=natparks.pals("Saguaro", 3)) +
+  ylab("MFI") +
+  xlab("NK donor condition") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.1)), trans = "log10") +
+  #ylim(c(0, 110)) +
+  stat_compare_means(label = "p.signif", comparisons = my_comparisons_treat, bracket.size = 0.6, paired=F, size = 5) +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"))
+```
+
+### Analysis of O-link data for Figure 7
+
+O-link analysis
+```{r}
+table <- read.csv("Mono_NK_olink.csv")
+table$Donor %<>% as.factor()
+table$NK_donor %<>% as.factor()
+table$Mono_donor %<>% as.factor()
+table$Condition %<>% factor(levels = c("RP10", "Healthy", "Moderate", "Severe"))
+table$Condition_fatal %<>% factor(levels = c("RP10", "Healthy", "Moderate", "Severe", "Fatal"))
+table$Donor_infection %<>% factor(levels = c("Healthy", "COVID-19"))
+table$Status %<>% factor(levels = c("Healthy", "Survived", "Fatal"))
+table$Fatal %<>% as.factor()
+table %<>% dplyr::select(-X)
+
+for (j in 11:ncol(table)) {
+  for (i in 1:nrow(table)) {
+    if (table[i,j] < 0.65) {
+      table[i,j] = 0
+    }
+    else {table[i,j] = table[i,j]
+    }
+  }
+}
+
+#write.csv(table, file = "Mono_NK_olink.csv")
+
+```
+
+Manually calculate BH-adjusted p-values for each comparison. Remove a few extra analytes that are not expressed by any donor. Assign y-positions for p-values on graphs.
+```{r}
+my_comparisons <- list(c("Healthy", "Moderate"), c("Healthy", "Severe"))
+
+graph <- table %>% gather(Analyte, Concentration, -Sample_ID, -Donor, -NK_donor, -Mono_donor, -Condition, -Condition_fatal, -Donor_infection, -Status, -Fatal, -Sample_ID_new)
+
+graph_avged <- graph %>% group_by(Analyte, Mono_donor) %>% mutate(Concentration.mean = mean(Concentration))
+
+anno_graph <- compare_means(Concentration ~ Condition, method = "wilcox.test", group.by = "Analyte", data = graph_avged, p.adjust.method = "BH") %>%
+ mutate(p.adj = format.pval(p.adj, digits = 4)) %>% dplyr::filter(Analyte != "TNFRSF9" & Analyte != "TNFB" & Analyte != "CST5" & Analyte != "IL10" & Analyte != "CXCL10") %>% arrange(Analyte)
+
+anno_graph_bonf <- compare_means(Concentration ~ Condition, method = "wilcox.test", group.by = "Analyte", data = graph, p.adjust.method = "bonferroni") %>%
+ mutate(p.adj = format.pval(p.adj, digits = 4)) %>% dplyr::filter(Analyte != "TNFRSF9" & Analyte != "TNFB" & Analyte != "CST5" & Analyte != "IL10" & Analyte != "CXCL10") %>% arrange(Analyte)
+
+graph_y <- graph_avged %>% group_by(Analyte) %>% mutate(y_pos = (max(Concentration))*1.3) %>% arrange(Analyte)
+
+#graph.small <- graph[!duplicated(graph$Analyte), ] %>% 
+  
+graph.small <- graph_y %>% group_by(Analyte)%>%slice(-(4:n())) %>% dplyr::filter(Analyte %in% anno_graph$Analyte) %>% arrange(Analyte)
+
+graph.small$multiplier <- rep(c(1,1.4,1.2), (nrow(graph.small)/3))
+graph.small %<>% mutate(y_pos_init = y_pos*multiplier) %>% arrange(Analyte)
+
+anno_graph <- cbind(anno_graph, graph.small[15])
+anno_graph$p.adj %<>% as.numeric()
+
+analytes <- anno_graph %>% dplyr::filter(p.adj <= 0.05)
+
+anno_graph.use <- anno_graph %>% dplyr::filter(Analyte %in% analytes$Analyte) %>% mutate(p.sym = case_when(p.adj > 0.05 ~ "NS",
+                         p.adj > 0.0051 & p.adj < 0.05 ~ "*",
+                         p.adj > 0.00051 & p.adj < 0.005 ~ "**",
+                         p.adj > 0.000051 & p.adj < 0.0005 ~ "***",
+                         TRUE ~ "****"))
+
+graph.use <- graph %>% dplyr::filter(Analyte %in% analytes$Analyte) 
+
+```
+
+Plot expression of all measurable analytes in supernatants (average of the two biological replicates)
+```{r}
+
+plot <- ggplot(data = graph.use %>% dplyr::filter(Mono_donor != "NA" & NK_donor == "MJL03"), aes(x = Condition, y = Concentration))
+plot +
+  facet_wrap(~Analyte, nrow = 4, scale = "free_y") +
+  geom_jitter(aes(color = Condition_fatal, shape = Fatal), size = 3, width = 0.2) +
+  geom_boxplot(aes(), alpha = 0) +
+  scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+  #scale_fill_taylor() +
+  ylab("Normalized Protein Expression") +
+  xlab("Monocyte donor condition") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.13))) +
+  #ylim(c(10,46)) +
+  geom_signif(
+    data=anno_graph.use, 
+    aes(xmin = group1, xmax = group2, annotations = p.sym, y_position = y_pos_init), manual= TRUE) +
+  #stat_compare_means(label = "p.adj", comparisons = my_comparisons, bracket.size = 0.6, paired=F, size = 3, p.adjust.methods = "bonferroni") +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank())
+
+
+```
+
+
+Making individual groups of plots
+```{r}
+chemo <- c("CCL20", "CCL23", "CCL28", "CXCL1", "CXCL5")
+graph.use.chemo <- graph.use %>% dplyr::filter(Analyte %in% chemo)
+anno_graph.use.chemo <- anno_graph.use %>% dplyr::filter(Analyte %in% chemo)
+
+inflam <- c("EN.RAGE", "MMP.1", "IL18", "CASP.8", "MCP.3", "LAP.TGF.beta.1", "TNF")
+graph.use.inflam <- graph.use %>% dplyr::filter(Analyte %in% inflam)
+anno_graph.use.inflam <- anno_graph.use %>% dplyr::filter(Analyte %in% inflam)
+
+other <- c("LAP.TGF.beta.1")
+graph.use.other <- graph.use %>% dplyr::filter(Analyte %in% other)
+anno_graph.use.other <- anno_graph.use %>% dplyr::filter(Analyte %in% other)
+
+other.labs <- c("EN-RAGE", "MMP-1", "IL-18", "Caspase 8", "MCP-3", "LAP\nTGF-B 1", "TNF")
+names(other.labs) <- c("EN.RAGE", "MMP.1", "IL18", "CASP.8", "MCP.3", "LAP.TGF.beta.1", "TNF")
+
+plot <- ggplot(data = graph.use.inflam %>% dplyr::filter(Mono_donor != "NA" & NK_donor == "MJL01"), aes(x = Condition, y = Concentration))
+plot +
+  facet_wrap(~Analyte, nrow = 2, scale = "free_y", labeller = labeller(Analyte = other.labs)) +
+  geom_jitter(aes(color = Condition_fatal, shape = Fatal), size = 3, width = 0.2) +
+  geom_boxplot(aes(), alpha = 0) +
+  scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+  #scale_fill_taylor() +
+  ylab("Normalized Protein\nExpression") +
+  xlab("Monocyte donor condition") +
+  scale_y_continuous(expand = expansion(mult=c(0.05,0.13))) +
+  #ylim(c(10,46)) +
+  geom_signif(
+    data=anno_graph.use.inflam, 
+    aes(xmin = group1, xmax = group2, annotations = p.sym, y_position = y_pos_init), manual= TRUE) +
+  #stat_compare_means(label = "p.adj", comparisons = my_comparisons, bracket.size = 0.6, paired=F, size = 3, p.adjust.methods = "bonferroni") +
+   theme_light() + theme(text = element_text(size = 20), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank())
+
+```
+
+O-link heatmap
+```{r}
+table.short <- table %>% dplyr::filter(Donor != "HOS0200" & Mono_donor != "None")
+
+avgexp <- aggregate((table.short), by = list(table.short$Donor), FUN = mean)
+meta.names <- colnames(table)[1:9]
+meta <- table %>% select(meta.names) %>% dplyr::filter(NK_donor != "MJL03" & Donor != "MJL01")
+avgexp %<>% select(-meta.names) 
+avgexp %<>% rename(Donor = "Group.1")
+donors <- table.short %>% dplyr::filter(NK_donor == "MJL01")
+avgexp.meta <- mutate(avgexp, donors)
+
+avgexp.meta.long <- avgexp.meta %>% column_to_rownames(var = "Mono_donor")
+
+t <- as.data.frame(t(avgexp.meta.long))[2:93,]
+t[] <- lapply(t, as.numeric)
+avgexp.z <- pheatmap:::scale_rows(t)
+avgexp.z %<>% na.omit()
+
+expressed <- rownames(t)
+
+column_annotation <- meta[match(colnames(avgexp.z),meta$Donor),]
+
+sum <- as.numeric(rowSums(t[59,]))
+
+### remove markers where there are only zeros
+for (i in 1:nrow(t)) {
+  sum <- as.numeric(rowSums(t[i,]))
+  if (is.na(sum) | sum == 0) {
+    t <- t[-i,]
+    print(i)
+  }
+}
+
+pal <- natparks.pals("SmokyMtns")
+
+Heatmap(t(t),
+        left_annotation = rowAnnotation(Condition=column_annotation$Condition,
+        annotation_name_gp = gpar(fontsize = 15),
+        col = list(Condition = c("Healthy" = pal[1],
+        "Moderate" = pal[2],
+        "Severe" = pal[3],
+        Fatal = c("N" = pal[2],
+        "Y" = pal[5])))),
+        col = magma(100),
+        name = "Normalized\nexprs",
+        row_names_gp = gpar(fontsize=0),
+        row_title_gp = gpar(fontsize=15),
+        column_names_gp = gpar(fontsize=15))
+
+```
+
+ O-link MDS plot
+```{r}
+df_samples = table
+
+plot_mds_new <- function (df_samples, protein_names, sample_info_names, color, 
+    sample_label = "") {
+    expr_median <- df_samples %>% group_by(.dots = sample_info_names) %>% 
+        summarise_at(protein_names, median) %>% as.data.frame
+    dist_matrix <- dist(expr_median[, -seq(sample_info_names)])
+    mds_res <- cmdscale(dist_matrix, eig = TRUE, k = 2)
+    explained_var <- (100 * mds_res$eig[seq_len(2)]/sum(mds_res$eig)) %>% 
+        round(digits = 1)
+    expr_median %<>% bind_cols(tibble(MDS1 = mds_res$points[, 
+        1], MDS2 = mds_res$points[, 2]))
+    protein_sd <- apply(expr_median[, protein_names], 2, sd)
+    protein_selection <- protein_names[protein_sd != 0]
+    expr_cor <- cor(expr_median[, protein_selection], expr_median[, 
+        c("MDS1", "MDS2")]) %>% as.tibble
+    expr_cor %<>% add_column(protein_selection)
+    expr_cor %<>% add_column(x0 = rep(0, nrow(expr_cor)))
+    expr_cor %<>% add_column(y0 = rep(0, nrow(expr_cor)))
+    circle <- function(center = c(0, 0), npoints = 100) {
+        r <- 1
+        tt <- seq(0, 2 * pi, length = npoints)
+        xx <- center[1] + r * cos(tt)
+        yy <- center[1] + r * sin(tt)
+        return(tibble(x = xx, y = yy))
+    }
+    corcir <- circle(c(0, 0), npoints = 100)
+    expr_cor_2 <- expr_cor %>% mutate(prod = MDS1*MDS2) %>% dplyr::filter(MDS1 > 0.5 & MDS2 > -0.1)
+    circle_plot <- ggplot() + geom_path(data = corcir, aes(x = .data$x, 
+        y = .data$y), colour = "gray65") + geom_hline(yintercept = 0, 
+        colour = "gray65") + geom_vline(xintercept = 0, colour = "gray65") + 
+        xlim(-1.1, 1.1) + ylim(-1.1, 1.1) + geom_segment(data = expr_cor, 
+        aes(x = .data$x0, y = .data$y0, xend = .data$MDS1, yend = .data$MDS2), 
+        colour = "gray65") + geom_text(data = expr_cor, aes(x = .data$MDS1, 
+        y = .data$MDS2, label = .data$protein_selection)) + labs(x = "MDS1") + 
+        labs(y = "MDS2") + theme_cowplot() + theme(axis.title = element_text(size = 25)) + coord_fixed()
+    mds_plot <- ggplot(expr_median, aes_string(x = "MDS1", y = "MDS2")) + 
+      geom_point(size = 3, aes(color = Condition_fatal)) + 
+      scale_color_manual(values=natparks.pals("SmokyMtns", 4)) +
+      #coord_fixed(ratio = explained_var[2]/explained_var[1]) + 
+      coord_fixed(ratio = 1/2) + 
+      xlab(paste0("MDS1 (", explained_var[1], "%)")) + ylab(paste0("MDS2 (", 
+        explained_var[2], "%)")) +
+      theme_light() + theme(text = element_text(size = 15), axis.ticks.x=element_blank(), panel.background = element_blank(), panel.grid.minor = element_blank(), legend.background = element_blank(), strip.background = element_rect(
+     color = "black", fill="white", size=1, linetype="solid"), strip.text = element_text(color = "black"), axis.text.x = element_blank())
+    if (nchar(sample_label) > 1) 
+        mds_plot <- mds_plot + 
+       #scale_color_manual(values=natparks.pals("SmokyMtns", 3)) +
+      geom_label(aes_string(label = sample_label))
+    plot_grid(circle_plot, nrow = 1 
+              #rel_widths = c(0.65, 0.35)
+              )
+}
+
+protein_names <- expressed
+sample_info_names <- colnames(table)[1:9]
+plot_mds_new(table %>% dplyr::filter(NK_donor == "MJL01"),
+         protein_names = protein_names,
+         sample_info_names = sample_info_names,
+         color = "Condition")
+
+```
+
+
+
+
+
